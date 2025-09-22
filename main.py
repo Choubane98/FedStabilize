@@ -1,9 +1,13 @@
 # python version 3.10.15
 # -*- coding: utf-8 -*-
 import os
-import matplotlib
-matplotlib.use('Agg')
+import cv2
+cv2.setNumThreads(0)
 
+import matplotlib
+
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 import copy
 import numpy as np
 import random
@@ -18,11 +22,9 @@ import torch.nn as nn
 from util.options import args_parser
 from util.local_training import LocalUpdate, globaltest, globaltest_cos_similarity
 from util.fedavg import FedAvg
-from util.util import add_noise, get_output, generate
+from util.util import add_noise, get_output, generate, extract_features
 from util.dataset import get_dataset
 from model.build_model import build_model
-
-
 from sklearn.manifold import TSNE
 import pickle
 
@@ -67,8 +69,8 @@ if __name__ == '__main__':
     # ---------------------Add Noise ---------------------------
     y_train = np.array(dataset_train.targets)
     y_train_noisy, gamma_s, real_noise_level = add_noise(args, y_train, dict_users)
-    dataset_train.targets = y_train_noisy
-    dataset_train_noaug.targets = y_train_noisy
+    dataset_train.targets = y_train_noisy.copy()
+    dataset_train_noaug.targets = y_train_noisy.copy()
 
     print(args)
 
@@ -126,11 +128,6 @@ if __name__ == '__main__':
     if args.mixup:
         tensorboard_path += "_Mix_%.1f" % (args.alpha)
     writer = SummaryWriter(tensorboard_path)
-    
-
-    #torch.manual_seed(args.seed)
-    #torch.cuda.manual_seed(args.seed)
-    #torch.cuda.manual_seed_all(args.seed)
 
     # build model
     netglob = build_model(args)
@@ -215,7 +212,7 @@ if __name__ == '__main__':
 
     clients_noise_less_thres = np.zeros(len(real_noise_level))
     clients_noise_less_thres[real_noise_level > args.clean_set_thres] = 1
-    #we consider clients to be clean if their noise ratio is <clean_set_thres (default 10) 
+    #for the ground truth: we consider clients to be clean if their noise ratio is <clean_set_thres (default 10) 
     ground_truth = clients_noise_less_thres
 
     # Predicted labels from GMM (noisy = 1, clean = 0)
@@ -236,19 +233,66 @@ if __name__ == '__main__':
     print("Clean client selection local model loss avg, Accuracy: %.4f, Precision: %.4f, Recall: %.4f \n" % (accuracy_client_selection, precision_clean_client, recall_clean_client))
 
     
-    #torch.save(netglob.state_dict(), outputs_path + "model_endstage1.pth")
+    torch.save(netglob.state_dict(), outputs_path + "model_endstage1.pth")
 
+    #t-SNE plot:
+    '''
+    features, labels = extract_features(args, netglob, dataset_test)
+
+    features_np = features.astype(np.float64) 
+
+    if args.model == 'resnet50':
+        prototypes_numpy = generate(2048, args.num_classes, seed=args.seed)
+    else:
+        prototypes_numpy = generate(512, args.num_classes, seed=args.seed)
+    
+    combined_features = np.vstack([features_np, prototypes_numpy])
+
+    tsne = TSNE(n_components=2, random_state=42)
+    combined_2d = tsne.fit_transform(combined_features)  
+
+    features_2d = combined_2d[:features_np.shape[0]]
+    prototypes_2d = combined_2d[features_np.shape[0]:]
+
+    cifar10_classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
+
+    plt.figure(figsize=(10, 8))
+
+    cmap = plt.get_cmap('tab20', args.num_classes) 
+
+    scatter = plt.scatter(features_2d[:, 0], features_2d[:, 1], c=labels, cmap=cmap, alpha=0.7, label='Data Points')
+    
+    plt.scatter(prototypes_2d[:, 0], prototypes_2d[:, 1], c='black', marker='x', s=100, label='Prototypes')
+    plt.legend()
+    
+    if args.dataset=="cifar10":
+        cbar = plt.colorbar(scatter, ticks=range(10))  
+        cbar.ax.set_yticklabels(cifar10_classes)  #
+    else:
+        plt.colorbar(scatter)  
+
+
+    plt.title('t-SNE Visualization of Feature Representations')
+    plt.xlabel('Component 1')
+    plt.ylabel('Component 2')
+
+    plt.savefig(outputs_path + 'tsne_visualization_stage1.png', dpi=300)
+
+    print(f"t-SNE plot saved")
+    '''
 
     torch.cuda.empty_cache()
     # ---------------------------- Stage 2 -------------------------------
-    
+        
+
     m = max(int(args.frac * args.num_users), 1)  # num_select_clients
     prob = [1/args.num_users for i in range(args.num_users)]
 
     for rnd in range(args.rounds2):
         w_locals, dict_locals = [], []
-        dataset_train.targets = y_train_noisy
-        dataset_train_noaug.targets = y_train_noisy
+        dataset_train.targets = y_train_noisy.copy()
+        dataset_train_noaug.targets = y_train_noisy.copy()
+
         idxs_users = np.random.choice(range(args.num_users), m, replace=False, p=prob)
         for idx in idxs_users:  # training over the subset
             if idx in noisy_set:
@@ -256,65 +300,28 @@ if __name__ == '__main__':
                 dataset_client = Subset(dataset_train_noaug, sample_idx)
                 loader = torch.utils.data.DataLoader(dataset=dataset_client, batch_size=100, shuffle=False)
                 output_whole, loss_whole, feature_whole = get_output(loader, netglob, args, True, criterion)
-
-
-                loss = (loss_whole-loss_whole.min())/(loss_whole.max()-loss_whole.min())
-                gmm_loss = GaussianMixture(n_components=2, random_state=args.seed).fit(np.array(loss).reshape(-1, 1))
-                labels_loss = gmm_loss.predict(np.array(loss).reshape(-1, 1))
-                gmm_clean_label_loss = np.argsort(gmm_loss.means_[:, 0])[0]
-                pred_n = np.where(labels_loss.flatten() != gmm_clean_label_loss)[0]
-
-                # True noisy samples
-                true_noisy_mask = (y_train[sample_idx] != y_train_noisy[sample_idx])
-
-                # Predicted noisy samples from GMM
-                pred_noisy_mask = np.zeros_like(true_noisy_mask)
-                pred_noisy_mask[pred_n] = 1  # Mark detected noisy samples
-
-                # Compute TP, FP, FN
-                TP = np.sum(pred_noisy_mask & true_noisy_mask)  # Correctly identified noisy
-                FP = np.sum(pred_noisy_mask & ~true_noisy_mask)  # Clean wrongly labeled as noisy
-                FN = np.sum(~pred_noisy_mask & true_noisy_mask)  # Noisy wrongly labeled as clean
-
-                # Compute Precision, Recall, and F1-score
-                precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-                recall = TP / (TP + FN) if (TP + FN) > 0 else 0
-                f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-
-                # Log results
-                f_acc.write(f"Client id {idx}, Noisy sample detection Precision: {precision:.4f}, Recall: {recall:.4f}, F1-score: {f1_score:.4f}\n")
-                f_acc.flush()
-
                 
-
                 feature_whole = torch.tensor(feature_whole).to(args.device)
                 feature_whole = F.normalize(feature_whole, p=2, dim=1)
                 cos_sim = F.cosine_similarity(feature_whole.unsqueeze(1), prototypes.unsqueeze(0), dim=2)
-                #y_predicted = torch.argmax(dot_products, dim=1)
                 y_predicted = torch.argmax(cos_sim, dim=1).cpu().numpy().astype(np.int64)
-                relabel_idx = np.where(torch.max(cos_sim.cpu(), axis=1).values > args.confidence_thres)[0]
-                relabel_final_idx = np.intersect1d(pred_n, relabel_idx)
-                y_train_noisy_new = np.array(dataset_train.targets)
+                confident_idx = np.where(torch.max(cos_sim.cpu(), axis=1).values > args.confidence_thres)[0]
+                y_train_noisy_new = np.array(dataset_train.targets, copy=True)
 
-                y_train_noisy_new[sample_idx[relabel_final_idx]] = y_predicted[relabel_final_idx]
-                dataset_train.targets = y_train_noisy_new
-                dataset_train_noaug.targets = y_train_noisy_new
+                y_train_noisy_new[sample_idx[confident_idx]] = y_predicted[confident_idx]
+                dataset_train.targets = y_train_noisy_new.copy()
+                dataset_train_noaug.targets = y_train_noisy_new.copy()
                 f_acc.write("Noise ratio before relab: %.4f\n" % (np.sum(y_train[sample_idx] != y_train_noisy[sample_idx])/len(y_train[sample_idx])))
-                detected_clean_samples = np.setdiff1d(sample_idx, sample_idx[pred_n])
-                confident_clean_samples = np.intersect1d(detected_clean_samples, sample_idx[relabel_idx])
-                f_acc.write("Ratio confident_clean/clean: %.4f\n" % (len(confident_clean_samples)/len(detected_clean_samples)))
-                if len(relabel_final_idx)>0:
-                    f_acc.write("Ratio confident_noisy/noisy: %.4f\n" % (len(relabel_final_idx)/len(pred_n)))
-                    accuracy_relab = np.sum(y_train_noisy_new[sample_idx[relabel_final_idx]] == y_train[sample_idx[relabel_final_idx]]) / len(y_train_noisy_new[sample_idx[relabel_final_idx]])
-                    f_acc.write("Accuracy relab confident samples: %.4f\n" % accuracy_relab)
-                else:
-                    f_acc.write("No confident predictions noisy \n") 
-                union_clean_confidentrelab = np.union1d(sample_idx[relabel_final_idx], confident_clean_samples)
-                if len(union_clean_confidentrelab>0):
-                    noise_ratio_union = np.sum(y_train[union_clean_confidentrelab] != y_train_noisy_new[union_clean_confidentrelab]) / len(union_clean_confidentrelab)
-                    f_acc.write("Noise ratio in trusted samples (detected clean + confident relabeled): %.4f\n" % noise_ratio_union)
-                    local = LocalUpdate(args=args, dataset=dataset_train, idxs=union_clean_confidentrelab)
-                    dict_locals.append(len(union_clean_confidentrelab))
+                f_acc.write("Ratio confident_samples/all_samples: %.4f\n" % (len(confident_idx)/len(sample_idx)))
+
+                confident_samples = sample_idx[confident_idx]
+                if len(confident_samples)>0:
+                    
+                    noise_ratio_union = np.sum(y_train[confident_samples] != y_train_noisy_new[confident_samples]) / len(confident_samples)
+
+                    f_acc.write("Noise ratio in confident samples: %.4f\n" % noise_ratio_union)
+                    local = LocalUpdate(args=args, dataset=dataset_train, idxs=confident_samples)
+                    dict_locals.append(len(confident_samples))
                     net_local = copy.deepcopy(netglob).to(args.device)
                     w_local, loss_local = local.update_weights(net=net_local, w_g=netglob, epoch=args.local_ep)
                     w_locals.append(copy.deepcopy(w_local))  # store every updated model
@@ -348,23 +355,24 @@ if __name__ == '__main__':
             writer.flush()
             if acc > best_acc:
                 best_acc = acc
-
-
+        
     f_acc.write("Best test acc: %.4f \n" % best_acc)
     f_acc.flush()
 
-    #torch.save(netglob.state_dict(), outputs_path + "model_endstage2.pth")
+    torch.save(netglob.state_dict(), outputs_path + "model_endstage2.pth")
 
     #t-SNE plot:
-    ''''
+    '''
+    features, labels = extract_features(args, netglob, dataset_test)
+
     features_np = features.astype(np.float64) 
 
     if args.model == 'resnet50':
-        prototypes = generate(2048, args.num_classes, filename="BCR", seed=args.seed)
+        prototypes_numpy = generate(2048, args.num_classes, seed=args.seed)
     else:
-        prototypes = generate(512, args.num_classes, filename="BCR", seed=args.seed)
+        prototypes_numpy = generate(512, args.num_classes, seed=args.seed)
     
-    combined_features = np.vstack([features_np, prototypes])
+    combined_features = np.vstack([features_np, prototypes_numpy])
 
     tsne = TSNE(n_components=2, random_state=42)
     combined_2d = tsne.fit_transform(combined_features)  
