@@ -1,8 +1,13 @@
 # python version 3.10.15
 # -*- coding: utf-8 -*-
 import os
+import cv2
+cv2.setNumThreads(0)
+
 import matplotlib
+
 matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 import copy
 import numpy as np
@@ -11,7 +16,6 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Subset
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.metrics import confusion_matrix, accuracy_score, precision_score, recall_score, f1_score
 from sklearn.mixture import GaussianMixture
 import torch.nn as nn
 
@@ -21,8 +25,6 @@ from util.fedavg import FedAvg
 from util.util import add_noise, get_output, generate
 from util.dataset import get_dataset
 from model.build_model import build_model
-
-
 from sklearn.manifold import TSNE
 import pickle
 
@@ -67,8 +69,8 @@ if __name__ == '__main__':
     # ---------------------Add Noise ---------------------------
     y_train = np.array(dataset_train.targets)
     y_train_noisy, gamma_s, real_noise_level = add_noise(args, y_train, dict_users)
-    dataset_train.targets = y_train_noisy
-    dataset_train_noaug.targets = y_train_noisy
+    dataset_train.targets = y_train_noisy.copy()
+    dataset_train_noaug.targets = y_train_noisy.copy()
 
     print(args)
 
@@ -126,11 +128,6 @@ if __name__ == '__main__':
     if args.mixup:
         tensorboard_path += "_Mix_%.1f" % (args.alpha)
     writer = SummaryWriter(tensorboard_path)
-    
-
-    #torch.manual_seed(args.seed)
-    #torch.cuda.manual_seed(args.seed)
-    #torch.cuda.manual_seed_all(args.seed)
 
     # build model
     netglob = build_model(args)
@@ -165,7 +162,7 @@ if __name__ == '__main__':
         acc = globaltest(netglob, dataset_test, args)
         if acc > best_acc:
             best_acc = acc
-        f_acc.write("Stage 1 round %d, test acc %.4f \n" % (rnd, acc))
+        f_acc.write("Stage 1 round %d, test acc (logits) %.4f \n" % (rnd, acc))
         f_acc.flush()
 
     LID_whole = np.zeros(len(y_train))
@@ -224,8 +221,8 @@ if __name__ == '__main__':
 
     for rnd in range(args.rounds2):
         w_locals, dict_locals = [], []
-        dataset_train.targets = y_train_noisy
-        dataset_train_noaug.targets = y_train_noisy
+        dataset_train.targets = y_train_noisy.copy()
+        dataset_train_noaug.targets = y_train_noisy.copy()
         idxs_users = np.random.choice(range(args.num_users), m, replace=False, p=prob)
         for idx in idxs_users:  # training over the subset
             if idx in noisy_set:
@@ -245,13 +242,12 @@ if __name__ == '__main__':
                 feature_whole = F.normalize(feature_whole, p=2, dim=1)
                 cos_sim = F.cosine_similarity(feature_whole.unsqueeze(1), prototypes.unsqueeze(0), dim=2)
                 y_predicted = torch.argmax(cos_sim, dim=1).cpu().numpy().astype(np.int64)
-                relabel_idx = np.where(torch.max(cos_sim.cpu(), axis=1).values > args.confidence_thres)[0]
-                relabel_final_idx = np.intersect1d(pred_n, relabel_idx)
-                y_train_noisy_new = np.array(dataset_train.targets)
+                confident_idx = np.where(torch.max(cos_sim.cpu(), axis=1).values > args.confidence_thres)[0]
+                y_train_noisy_new = np.array(dataset_train.targets, copy=True)
 
-                y_train_noisy_new[sample_idx[relabel_final_idx]] = y_predicted[relabel_final_idx]
-                dataset_train.targets = y_train_noisy_new
-                dataset_train_noaug.targets = y_train_noisy_new
+                y_train_noisy_new[sample_idx[confident_idx]] = y_predicted[confident_idx]
+                dataset_train.targets = y_train_noisy_new.copy()
+                dataset_train_noaug.targets = y_train_noisy_new.copy()
 
                 #for Clothing1M: all samples are used for local training, where only confident samples are relabelized for identified noisy samples
                 local = LocalUpdate(args=args, dataset=dataset_train, idxs=dict_users[idx])
@@ -281,7 +277,7 @@ if __name__ == '__main__':
             netglob.load_state_dict(copy.deepcopy(w_glob_fl))
 
             acc = globaltest(netglob, dataset_test, args)
-            f_acc.write("Stage 2 round %d, test acc %.4f \n" % (rnd, acc))
+            f_acc.write("Stage 2 round %d, test acc (logits) %.4f \n" % (rnd, acc))
             f_acc.flush()
             writer.add_scalar('Accuracy', acc, rnd + args.rounds1)
             writer.flush()
@@ -293,50 +289,5 @@ if __name__ == '__main__':
     f_acc.flush()
 
     #torch.save(netglob.state_dict(), outputs_path + "model_endstage2.pth")
-
-    #t-SNE plot:
-    ''''
-    features_np = features.astype(np.float64) 
-
-    if args.model == 'resnet50':
-        prototypes = generate(2048, args.num_classes, filename="BCR", seed=args.seed)
-    else:
-        prototypes = generate(512, args.num_classes, filename="BCR", seed=args.seed)
-    
-    combined_features = np.vstack([features_np, prototypes])
-
-    tsne = TSNE(n_components=2, random_state=42)
-    combined_2d = tsne.fit_transform(combined_features)  
-
-    features_2d = combined_2d[:features_np.shape[0]]
-    prototypes_2d = combined_2d[features_np.shape[0]:]
-
-    cifar10_classes = ['airplane', 'automobile', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck']
-
-    plt.figure(figsize=(10, 8))
-
-    cmap = plt.get_cmap('tab20', args.num_classes) 
-
-    scatter = plt.scatter(features_2d[:, 0], features_2d[:, 1], c=labels, cmap=cmap, alpha=0.7, label='Data Points')
-    
-    plt.scatter(prototypes_2d[:, 0], prototypes_2d[:, 1], c='black', marker='x', s=100, label='Prototypes')
-    plt.legend()
-    
-    if args.dataset=="cifar10":
-        cbar = plt.colorbar(scatter, ticks=range(10))  
-        cbar.ax.set_yticklabels(cifar10_classes)  #
-    else:
-        plt.colorbar(scatter)  
-
-
-    plt.title('t-SNE Visualization of Feature Representations')
-    plt.xlabel('Component 1')
-    plt.ylabel('Component 2')
-
-    plt.savefig(outputs_path + 'tsne_visualization_stage2.png', dpi=300)
-
-    print(f"t-SNE plot saved")
-    '''
-
     torch.cuda.empty_cache()
 
